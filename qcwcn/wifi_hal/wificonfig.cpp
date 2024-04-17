@@ -63,6 +63,7 @@
 
 #include "sync.h"
 #define LOG_TAG  "WifiHAL"
+#include <cutils/properties.h>
 #include <utils/Log.h>
 #include <time.h>
 #include <errno.h>
@@ -82,7 +83,33 @@
 #define NUM_OF_SAR_LIMITS_SPECS 2
 #define NUM_OF_SPEC_CHAINS 2
 
+/* Find first active wlan interface */
+static int get_first_active_wlan_ifname_id(hal_info *info)
+{
+    char buf[PROPERTY_VALUE_MAX];
+    int id = -1;
 
+    // Check active interface set by legacy wifi hal
+    if ((property_get("wifi.active.interface", buf, NULL) != 0)
+            || (property_get("wifi.interface", buf, NULL) != 0)) {
+        id = if_nametoindex(buf);
+    } else if (info && info->num_interfaces > 0) {
+        // Active interface is not present Or lib is loaded via other module.
+        // Check other wlan/swlan interface presence.
+        for(int i = 0; i < info->num_interfaces; i++)
+            if (strncmp(info->interfaces[i]->name, "wlan", 4) == 0
+                    || strncmp(info->interfaces[i]->name, "swlan", 5) == 0)
+                id = info->interfaces[i]->id;
+    }
+
+    // No interface entry found. Fallback to default wlan0 interface
+    if (id == -1)
+        id = if_nametoindex("wlan0");
+
+    ALOGV("Using interface: %s [%d]", if_indextoname(id, buf), id);
+
+    return id;
+}
 
 /* Implementation of the API functions exposed in wifi_config.h */
 wifi_error wifi_extended_dtim_config_set(wifi_request_id id,
@@ -851,7 +878,9 @@ wifi_error wifi_select_tx_power_scenario(wifi_interface_handle handle,
     if  (info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_1)
         return wifi_select_SARv01_tx_power_scenario(handle,scenario);
     else if(info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_2 ||
-              info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_3)
+            info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_3 ||
+            info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_4 ||
+            info->sar_version == QCA_WLAN_VENDOR_SAR_VERSION_5)
         return wifi_select_SARv02_tx_power_scenario(handle,scenario);
     else {
       ALOGE("wifi_select_tx_power_scenario %u invalid or not supported", (u32)info->sar_version);
@@ -955,7 +984,7 @@ wifi_error wifi_set_thermal_mitigation_mode(wifi_handle handle,
 
     /* Set the interface Id of the message. */
     if (wifiConfigCommand->put_u32(NL80211_ATTR_IFINDEX,
-                                   info->interfaces[0]->id)) {
+                                   get_first_active_wlan_ifname_id(info))) {
         ret = WIFI_ERROR_UNKNOWN;
         ALOGE("%s: Failed to put iface id", __FUNCTION__);
         goto cleanup;
@@ -1123,10 +1152,24 @@ wifi_error WiFiConfigCommand::requestEvent()
     wifi_error res = WIFI_SUCCESS;
     struct nl_cb *cb = NULL;
 
+    if (mInfo == NULL) {
+       ALOGE("%s: Wifi is turned off",__FUNCTION__);
+       nl_cb_put(NULL);
+       mMsg.destroy();
+       return WIFI_ERROR_UNKNOWN;
+    }
+
+    pthread_mutex_lock(&mInfo->cb_lock);
+
     cb = nl_cb_alloc(NL_CB_DEFAULT);
     if (!cb) {
         ALOGE("%s: Callback allocation failed",__FUNCTION__);
         res = WIFI_ERROR_OUT_OF_MEMORY;
+        goto out;
+    }
+    if (mInfo->cmd_sock == NULL) {
+        ALOGE("%s: Socket is Null",__FUNCTION__);
+        res = WIFI_ERROR_UNKNOWN;
         goto out;
     }
 
@@ -1167,6 +1210,7 @@ out:
     nl_cb_put(cb);
     /* Cleanup the mMsg */
     mMsg.destroy();
+    pthread_mutex_unlock(&mInfo->cb_lock);
     return res;
 }
 
@@ -1328,7 +1372,8 @@ wifi_error wifi_virtual_interface_create(wifi_handle handle,
             break;
     }
     wifiConfigCommand->create_generic(NL80211_CMD_NEW_INTERFACE);
-    wifiConfigCommand->put_u32(NL80211_ATTR_IFINDEX,info->interfaces[0]->id);
+    wifiConfigCommand->put_u32(NL80211_ATTR_IFINDEX,
+                               get_first_active_wlan_ifname_id(info));
     wifiConfigCommand->put_string(NL80211_ATTR_IFNAME, ifname);
     wifiConfigCommand->put_u32(NL80211_ATTR_IFTYPE, type);
     /* Send the NL msg. */
@@ -1629,7 +1674,7 @@ wifi_error wifi_multi_sta_set_use_case(wifi_handle handle,
 
     /* Set the interface Id of the message. */
     if (wifiConfigCommand->put_u32(NL80211_ATTR_IFINDEX,
-                                   info->interfaces[0]->id)) {
+                                   get_first_active_wlan_ifname_id(info))) {
         ret = WIFI_ERROR_UNKNOWN;
         ALOGE("%s: Failed to put iface id", __FUNCTION__);
         goto cleanup;

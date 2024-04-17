@@ -15,7 +15,7 @@
  *
  * Changes from Qualcomm Innovation Center are provided under the following license:
  *
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted (subject to the limitations in the
@@ -75,7 +75,7 @@
 #include <cld80211_lib.h>
 
 #include <sys/types.h>
-#include "list.h"
+#include "wifihal_list.h"
 #include <unistd.h>
 
 #include "sync.h"
@@ -85,6 +85,7 @@
 #include "wifi_hal.h"
 #include "wifi_hal_ctrl.h"
 #include "common.h"
+#include "nan_i.h"
 #include "cpp_bindings.h"
 #include "ifaceeventhandler.h"
 #include "wifiloggercmd.h"
@@ -156,6 +157,12 @@ wifi_error wifi_get_supported_iface_concurrency_matrix(
         wifi_iface_concurrency_matrix *iface_concurrency_matrix);
 #endif /* TARGET_SUPPORTS_WEARABLES */
 
+#ifdef WPA_PASN_LIB
+void wifihal_event_mgmt_tx_status(wifi_handle handle, struct nlattr *cookie,
+                                  const u8 *frame, size_t len, struct nlattr *ack);
+void wifihal_event_mgmt(wifi_handle handle, struct nlattr *freq, const u8 *frame,
+                        size_t len);
+#endif
 /* Initialize/Cleanup */
 
 wifi_interface_handle wifi_get_iface_handle(wifi_handle handle, char *name)
@@ -527,7 +534,7 @@ static wifi_error wifi_init_user_sock(hal_info *info)
 
 static wifi_error wifi_init_cld80211_sock_cb(hal_info *info)
 {
-    struct nl_cb *cb = nl_socket_get_cb(info->cldctx->sock);
+    struct nl_cb *cb = nl_socket_get_cb(info->user_sock);
     if (cb == NULL) {
         ALOGE("Could not get cb");
         return WIFI_ERROR_UNKNOWN;
@@ -912,6 +919,60 @@ static u32 get_vendor_filter_mask(u32 in_mask)
     return op_mask;
 }
 
+wifi_error wifi_get_chip_capabilities(wifi_handle handle,
+                 wifi_chip_capabilities *chip_capabilities)
+{
+    wifi_tdls_capabilities tdls_caps;
+    hal_info *info;
+    wifi_interface_handle iface_handle;
+
+    if (!handle) {
+         ALOGE("%s: Error, wifi_handle NULL", __FUNCTION__);
+         return WIFI_ERROR_INVALID_ARGS;
+    }
+
+    info = getHalInfo(handle);
+    if (!info || info->num_interfaces < 1) {
+         ALOGE("%s: Error, wifi_handle NULL or base wlan interface not present",
+               __FUNCTION__);
+         return WIFI_ERROR_INVALID_ARGS;
+    }
+
+    /* Below are the boot time caps so by this time it must be filled */
+    if (info->capa.max_mlo_association_link_count < 0 ||
+        info->capa.max_mlo_str_link_count < 0 )
+    {
+        ALOGE("%s wifihal does not have req mlo caps", __func__);
+        return WIFI_ERROR_NOT_SUPPORTED;
+    }
+
+    iface_handle = wifi_get_iface_handle(handle, "wlan0");
+    if (!iface_handle) {
+        ALOGE("%s no iface with wlan0", __func__);
+        return WIFI_ERROR_UNKNOWN;
+    }
+
+    memset(&tdls_caps, 0, sizeof(wifi_tdls_capabilities));
+    tdls_caps.max_concurrent_tdls_session_num = -1;
+    wifi_get_tdls_capabilities(iface_handle, &tdls_caps);
+    if (tdls_caps.max_concurrent_tdls_session_num < 0)
+    {
+        ALOGE("%s wifihal does not have req tdls caps", __func__);
+        return WIFI_ERROR_NOT_SUPPORTED;
+    }
+    chip_capabilities->max_concurrent_tdls_session_count =
+        tdls_caps.max_concurrent_tdls_session_num;
+    chip_capabilities->max_mlo_association_link_count =
+        info->capa.max_mlo_association_link_count;
+    chip_capabilities->max_mlo_str_link_count =
+        info->capa.max_mlo_str_link_count;
+
+    ALOGD("%s: max mlo assoc link cnt: %d str link cnt %d",
+                      __func__, info->capa.max_mlo_association_link_count,
+                      info->capa.max_mlo_str_link_count);
+    return WIFI_SUCCESS;
+}
+
 wifi_error wifi_get_usable_channels(wifi_handle handle, u32 band_mask,
                                     u32 iface_mode_mask, u32 filter_mask,
                                     u32 max_size, u32* size,
@@ -1135,6 +1196,12 @@ wifi_error init_wifi_vendor_hal_func_table(wifi_hal_fn *fn) {
     fn->wifi_get_supported_iface_concurrency_matrix =
                                 wifi_get_supported_iface_concurrency_matrix;
 #endif /* TARGET_SUPPORTS_WEARABLES */
+    fn->wifi_nan_pairing_request = nan_pairing_request;
+    fn->wifi_nan_pairing_indication_response = nan_pairing_indication_response;
+    fn->wifi_nan_bootstrapping_request = nan_bootstrapping_request;
+    fn->wifi_nan_bootstrapping_indication_response =
+                                nan_bootstrapping_indication_response;
+    fn->wifi_get_chip_capabilities = wifi_get_chip_capabilities;
 
     return WIFI_SUCCESS;
 }
@@ -1183,6 +1250,8 @@ wifi_error wifi_initialize(wifi_handle *handle)
     }
 
     memset(info, 0, sizeof(*info));
+    info->capa.max_mlo_association_link_count = -1;
+    info->capa.max_mlo_str_link_count = -1;
 
     cmd_sock = wifi_create_nl_socket(WIFI_HAL_CMD_SOCK_PORT,
                                                      NETLINK_GENERIC);
@@ -1271,7 +1340,11 @@ wifi_error wifi_initialize(wifi_handle *handle)
 
     info->cldctx = cld80211_init();
     if (info->cldctx != NULL) {
-        info->user_sock = info->cldctx->sock;
+        info->user_sock = cld80211_get_nl_socket_ctx(info->cldctx);
+        if (!info->user_sock) {
+            ALOGE("cld sock is NULL");
+            goto cld80211_cleanup;
+        }
         ret = wifi_init_cld80211_sock_cb(info);
         if (ret != WIFI_SUCCESS) {
             ALOGE("Could not set cb for CLD80211 family");
@@ -1466,6 +1539,19 @@ wifi_error wifi_initialize(wifi_handle *handle)
     ALOGV("support_nan_ext_cmd is %d",
           info->support_nan_ext_cmd);
 
+    if (secure_nan_init(iface_handle))
+        ALOGE("%s: secure nan init failed", __FUNCTION__);
+
+    if (nan_register_action_frames(iface_handle)) {
+        ALOGE("%s: registering NAN action frame failed", __FUNCTION__);
+        goto unload;
+    }
+
+    if (nan_register_action_dual_protected_frames(iface_handle)) {
+        ALOGE("%s: registering NAN action dual protected frame failed", __FUNCTION__);
+        goto unload;
+    }
+
 #ifndef TARGET_SUPPORTS_WEARABLES
     ret = wifi_get_supported_iface_combination(iface_handle);
     if (ret != WIFI_SUCCESS) {
@@ -1640,6 +1726,8 @@ static void internal_cleaned_up_handler(wifi_handle handle)
     cleanupRSSIMonitorHandler(info);
     cleanupRadioHandler(info);
     cleanupTCPParamCommand(info);
+    if (secure_nan_deinit(info))
+        ALOGE("%s: secure nan deinit failed", __FUNCTION__);
 
     if (info->num_event_cb)
         ALOGE("%d events were leftover without being freed",
@@ -2213,6 +2301,46 @@ static int internal_valid_message_handler(nl_msg *msg, void *arg)
                   event.get_cmdString(), vendor_id, subcmd);
         }
     }
+    else if(cmd == NL80211_CMD_FRAME ||
+        cmd == NL80211_CMD_FRAME_TX_STATUS)
+    {
+        size_t len;
+        const u8 *data;
+        int ifidx = -1;
+        struct nlattr *frame;
+        struct nlattr *tb[NL80211_ATTR_MAX + 1];
+        struct genlmsghdr *gnlh = (genlmsghdr *) nlmsg_data(nlmsg_hdr(msg));
+
+        nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+                  genlmsg_attrlen(gnlh, 0), NULL);
+
+        if (tb[NL80211_ATTR_IFINDEX])
+            ifidx = nla_get_u32(tb[NL80211_ATTR_IFINDEX]);
+
+        ALOGV("nl80211: Drv Event %d (%s) received for ifidx:%d",
+              cmd, event.get_cmdString(), ifidx);
+
+        frame = tb[NL80211_ATTR_FRAME];
+
+        if (frame == NULL) {
+            ALOGD("No Frame body");
+            return WIFI_SUCCESS;
+        }
+
+        data = (const u8*) nla_data(frame);
+        len = nla_len(frame);
+
+#ifdef WPA_PASN_LIB
+        if (cmd == NL80211_CMD_FRAME) {
+            wifihal_event_mgmt(handle, tb[NL80211_ATTR_WIPHY_FREQ],
+                               (const u8*) nla_data(frame), nla_len(frame));
+        } else {
+            wifihal_event_mgmt_tx_status(handle, tb[NL80211_ATTR_COOKIE],
+                                         (const u8*) nla_data(frame),
+                                         nla_len(frame), tb[NL80211_ATTR_ACK]);
+        }
+#endif
+    }
     else if((info->wifihal_ctrl_sock.s > 0) && (cmd == NL80211_CMD_FRAME))
     {
        struct genlmsghdr *genlh;
@@ -2408,7 +2536,8 @@ static bool is_wifi_interface(const char *name)
 
     if (strncmp(name, "wlan", 4) != 0 && strncmp(name, "p2p", 3) != 0
         && strncmp(name, "wifi", 4) != 0
-        && strncmp(name, "swlan", 5) != 0) {
+        && strncmp(name, "swlan", 5) != 0
+        && strncmp(name, "xsap", 4) != 0) {
         /* not a wifi interface; ignore it */
         return false;
     } else {
@@ -3610,7 +3739,7 @@ public:
     virtual int handleResponse(WifiEvent& reply) {
         struct nlattr **tb = reply.attributes();
 
-        if (tb[NL80211_ATTR_INTERFACE_COMBINATIONS]) {
+        if (tb[NL80211_ATTR_SUPPORTED_IFTYPES]  ||  tb[NL80211_ATTR_INTERFACE_COMBINATIONS]) {
             if (halinfo == NULL) {
                 ALOGE("hal_info is NULL. Abort parsing");
                 return NL_SKIP;
@@ -3619,107 +3748,147 @@ public:
             wifi_iface_concurrency_matrix* matrix = &halinfo->iface_comb_matrix;
             wifi_iface_combination *iface_combination;
             wifi_iface_limit *iface_limits;
-            struct nlattr *nl_combi;
-            int rem, i = 0;
+            int rem, i = 1;
+            // The initial value of 'i; is '1' for all concurency.
+            // '0' position is for only single iface.
 
             matrix->num_iface_combinations = 0;
-
-            nla_for_each_nested(nl_combi, tb[NL80211_ATTR_INTERFACE_COMBINATIONS], rem) {
-                struct nlattr *tb_comb[NUM_NL80211_IFACE_COMB];
-                struct nlattr *tb_limit[NUM_NL80211_IFACE_LIMIT];
-                struct nlattr *nl_limit, *nl_mode;
-                int err, rem_limit, rem_mode, j = 0;
-                static struct nla_policy
-                iface_combination_policy[NUM_NL80211_IFACE_COMB] = {
-                    [NL80211_IFACE_COMB_LIMITS] = { .type = NLA_NESTED },
-                    [NL80211_IFACE_COMB_MAXNUM] = { .type = NLA_U32 },
-                    [NL80211_IFACE_COMB_STA_AP_BI_MATCH] = { .type = NLA_FLAG },
-                    [NL80211_IFACE_COMB_NUM_CHANNELS] = { .type = NLA_U32 },
-                    [NL80211_IFACE_COMB_RADAR_DETECT_WIDTHS] = { .type = NLA_U32 },
-                },
-                iface_limit_policy[NUM_NL80211_IFACE_LIMIT] = {
-                    [NL80211_IFACE_LIMIT_TYPES] = { .type = NLA_NESTED },
-                    [NL80211_IFACE_LIMIT_MAX] = { .type = NLA_U32 },
-                };
-
-                err = nla_parse_nested(tb_comb, MAX_NL80211_IFACE_COMB,
-                                       nl_combi, iface_combination_policy);
-                if (err || !tb_comb[NL80211_IFACE_COMB_LIMITS] ||
-                    !tb_comb[NL80211_IFACE_COMB_MAXNUM] ||
-                    !tb_comb[NL80211_IFACE_COMB_NUM_CHANNELS]) {
-                        ALOGE("Broken iface combination detected. skip it");
-                        continue; /* broken combination */
-                }
-
-                iface_combination = &matrix->iface_combinations[i];
-                iface_combination->max_ifaces = nla_get_u32(tb_comb[NL80211_IFACE_COMB_MAXNUM]);
+            if (tb[NL80211_ATTR_SUPPORTED_IFTYPES]) {
+                struct nlattr *nl_combi;
+                iface_combination = &matrix->iface_combinations[0];
+                iface_combination->max_ifaces = 1;
                 iface_limits = iface_combination->iface_limits;
-                nla_for_each_nested(nl_limit, tb_comb[NL80211_IFACE_COMB_LIMITS],
-                                    rem_limit) {
-                    if (j == MAX_IFACE_LIMITS) {
-                        ALOGE("Can't parse more than %d iface limits", MAX_IFACE_LIMITS);
-                        continue;
-                    }
-
-                    err = nla_parse_nested(tb_limit, MAX_NL80211_IFACE_LIMIT,
-                                           nl_limit, iface_limit_policy);
-                    if (err || !tb_limit[NL80211_IFACE_LIMIT_TYPES]) {
-                        ALOGE("Broken iface limt types detected. skip it");
-                        continue; /* broken combination */
-                    }
-
-                    iface_limits[j].iface_mask = 0;
-                    iface_limits[j].max_limit = nla_get_u32(tb_limit[NL80211_IFACE_LIMIT_MAX]);
-                    bool is_p2p_go = false, is_p2p_client = false;
-                    nla_for_each_nested(nl_mode,
-                                        tb_limit[NL80211_IFACE_LIMIT_TYPES],
-                                        rem_mode) {
-                        int ift = nla_type(nl_mode);
-                        switch (ift) {
+                bool is_p2p_client = false;
+                bool is_p2p_go = false;
+                iface_limits[0].max_limit = 1;
+                nla_for_each_nested(nl_combi, tb[NL80211_ATTR_SUPPORTED_IFTYPES], rem) {
+                    int ift = nla_type(nl_combi);
+                    switch (ift) {
                         case NL80211_IFTYPE_STATION:
-                            iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_STA);
+                            iface_limits[0].iface_mask |= BIT(WIFI_INTERFACE_TYPE_STA);
+                            break;
+                        case NL80211_IFTYPE_AP:
+                            iface_limits[0].iface_mask |= BIT(WIFI_INTERFACE_TYPE_AP);
                             break;
                         case NL80211_IFTYPE_P2P_GO:
                             is_p2p_go = true;
-                            iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_P2P);
                             break;
                         case NL80211_IFTYPE_P2P_CLIENT:
                             is_p2p_client = true;
-                            iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_P2P);
-                            break;
-                        case NL80211_IFTYPE_AP:
-                            iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_AP);
                             break;
                         case NL80211_IFTYPE_NAN:
-                            iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_NAN);
-                            break;
-                        case NL80211_IFTYPE_P2P_DEVICE:
-                            ALOGI("Ignore p2p_device iface type");
-                            iface_limits[j].max_limit--;
+                            iface_limits[0].iface_mask |= BIT(WIFI_INTERFACE_TYPE_NAN);
                             break;
                         default:
                             ALOGI("Ignore unsupported iface type: %d", ift);
                             break;
-                        }
                     }
-                    // Remove P2P if both client/Go are not set.
-                    if ((iface_limits[j].iface_mask & BIT(WIFI_INTERFACE_TYPE_P2P))
-                            && (!is_p2p_client || !is_p2p_go))
-                        iface_limits[j].iface_mask &= ~BIT(WIFI_INTERFACE_TYPE_P2P);
-
-                    // Ignore Unsupported Ifaces (ex Monitor interface)
-                    if (iface_limits[j].iface_mask)
-                        j++;
                 }
-                iface_combination->num_iface_limits = j;
-                i++;
-                if (i == MAX_IFACE_COMBINATIONS) {
-                    ALOGE("%s max iface combination %u limit reached. Stop processing further", __func__, i);
-                    break;
+                if (is_p2p_go & is_p2p_client) {
+                    iface_limits[0].iface_mask |= BIT(WIFI_INTERFACE_TYPE_P2P);
+                }
+                iface_combination->num_iface_limits = 1;
+            }
+            if (tb[NL80211_ATTR_INTERFACE_COMBINATIONS]) {
+                struct nlattr *nl_combi;
+                nla_for_each_nested(nl_combi, tb[NL80211_ATTR_INTERFACE_COMBINATIONS], rem) {
+                    struct nlattr *tb_comb[NUM_NL80211_IFACE_COMB];
+                    struct nlattr *tb_limit[NUM_NL80211_IFACE_LIMIT];
+                    struct nlattr *nl_limit, *nl_mode;
+                    int err, rem_limit, rem_mode, j = 0;
+                    static struct nla_policy
+                    iface_combination_policy[NUM_NL80211_IFACE_COMB] = {
+                        [NL80211_IFACE_COMB_LIMITS] = { .type = NLA_NESTED },
+                        [NL80211_IFACE_COMB_MAXNUM] = { .type = NLA_U32 },
+                        [NL80211_IFACE_COMB_STA_AP_BI_MATCH] = { .type = NLA_FLAG },
+                        [NL80211_IFACE_COMB_NUM_CHANNELS] = { .type = NLA_U32 },
+                        [NL80211_IFACE_COMB_RADAR_DETECT_WIDTHS] = { .type = NLA_U32 },
+                    },
+                    iface_limit_policy[NUM_NL80211_IFACE_LIMIT] = {
+                        [NL80211_IFACE_LIMIT_TYPES] = { .type = NLA_NESTED },
+                        [NL80211_IFACE_LIMIT_MAX] = { .type = NLA_U32 },
+                    };
+
+                    err = nla_parse_nested(tb_comb, MAX_NL80211_IFACE_COMB,
+                                           nl_combi, iface_combination_policy);
+                    if (err || !tb_comb[NL80211_IFACE_COMB_LIMITS] ||
+                        !tb_comb[NL80211_IFACE_COMB_MAXNUM] ||
+                        !tb_comb[NL80211_IFACE_COMB_NUM_CHANNELS]) {
+                            ALOGE("Broken iface combination detected. skip it");
+                            continue; /* broken combination */
+                    }
+
+                    iface_combination = &matrix->iface_combinations[i];
+                    iface_combination->max_ifaces = nla_get_u32(tb_comb[NL80211_IFACE_COMB_MAXNUM]);
+                    iface_limits = iface_combination->iface_limits;
+                    nla_for_each_nested(nl_limit, tb_comb[NL80211_IFACE_COMB_LIMITS],
+                                        rem_limit) {
+                        if (j == MAX_IFACE_LIMITS) {
+                            ALOGE("Can't parse more than %d iface limits", MAX_IFACE_LIMITS);
+                            continue;
+                        }
+
+                        err = nla_parse_nested(tb_limit, MAX_NL80211_IFACE_LIMIT,
+                                               nl_limit, iface_limit_policy);
+                        if (err || !tb_limit[NL80211_IFACE_LIMIT_TYPES]) {
+                            ALOGE("Broken iface limt types detected. skip it");
+                            continue; /* broken combination */
+                        }
+
+                        iface_limits[j].iface_mask = 0;
+                        iface_limits[j].max_limit = nla_get_u32(tb_limit[NL80211_IFACE_LIMIT_MAX]);
+                        bool is_p2p_go = false, is_p2p_client = false;
+                        nla_for_each_nested(nl_mode,
+                                            tb_limit[NL80211_IFACE_LIMIT_TYPES],
+                                            rem_mode) {
+                            int ift = nla_type(nl_mode);
+                            switch (ift) {
+                            case NL80211_IFTYPE_STATION:
+                                iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_STA);
+                                break;
+                            case NL80211_IFTYPE_P2P_GO:
+                                is_p2p_go = true;
+                                iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_P2P);
+                                break;
+                            case NL80211_IFTYPE_P2P_CLIENT:
+                                is_p2p_client = true;
+                                iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_P2P);
+                                break;
+                            case NL80211_IFTYPE_AP:
+                                iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_AP);
+                                break;
+                            case NL80211_IFTYPE_NAN:
+                                iface_limits[j].iface_mask |= BIT(WIFI_INTERFACE_TYPE_NAN);
+                                break;
+                            case NL80211_IFTYPE_P2P_DEVICE:
+                                ALOGI("Ignore p2p_device iface type");
+                                iface_limits[j].max_limit--;
+                                break;
+                            default:
+                                ALOGI("Ignore unsupported iface type: %d", ift);
+                                break;
+                            }
+                        }
+                        // Remove P2P if both client/Go are not set.
+                        if ((iface_limits[j].iface_mask & BIT(WIFI_INTERFACE_TYPE_P2P))
+                                && (!is_p2p_client || !is_p2p_go))
+                            iface_limits[j].iface_mask &= ~BIT(WIFI_INTERFACE_TYPE_P2P);
+
+                        // Ignore Unsupported Ifaces (ex Monitor interface)
+                        if (iface_limits[j].iface_mask)
+                            j++;
+                    }
+                    iface_combination->num_iface_limits = j;
+                    i++;
+                    if (i == MAX_IFACE_COMBINATIONS) {
+                        ALOGE("%s max iface combination %u limit reached. Stop processing further", __func__, i);
+                        break;
+                    }
                 }
             }
             matrix->num_iface_combinations = i;
-            derive_bridge_ap_support(matrix);
+            if (i > 1)
+                derive_bridge_ap_support(matrix);
         }
         return NL_SKIP;
     }
@@ -3833,7 +4002,7 @@ cleanup:
     return ret;
 }
 
-#define SIZEOF_TLV_HDR 4
+#define SIZEOF_TLV_HEADER 4
 #define OEM_DATA_TLV_TYPE_HEADER 1
 #define OEM_DATA_CMD_SET_SKIP_CAC   18
 
@@ -3848,7 +4017,7 @@ static int wifi_add_oem_data_head(int cmd_id, u8* oem_buf, size_t max)
     oem_hdr.cmd_id = cmd_id;
     oem_hdr.request_idx = 0;
 
-    if ((SIZEOF_TLV_HDR + sizeof(oem_hdr)) > max) {
+    if ((SIZEOF_TLV_HEADER + sizeof(oem_hdr)) > max) {
         return 0;
     }
 
@@ -3859,7 +4028,7 @@ static int wifi_add_oem_data_head(int cmd_id, u8* oem_buf, size_t max)
     memcpy(oem_buf, (u8 *)&oem_hdr, sizeof(oem_hdr));
     oem_buf += sizeof(oem_hdr);
 
-    return (SIZEOF_TLV_HDR + sizeof(oem_hdr));
+    return (SIZEOF_TLV_HEADER + sizeof(oem_hdr));
 }
 
 
@@ -3965,3 +4134,72 @@ wifi_error wifi_get_supported_iface_concurrency_matrix(
     return WIFI_SUCCESS;
 }
 #endif /* TARGET_SUPPORTS_WEARABLES */
+
+#ifdef WPA_PASN_LIB
+
+void wifihal_event_mgmt_tx_status(wifi_handle handle, struct nlattr *cookie,
+                                  const u8 *frame, size_t len, struct nlattr *ack)
+{
+    int ret = 0;
+    struct pasn_data *pasn;
+    hal_info *info = getHalInfo(handle);
+    struct nan_pairing_peer_info *peer;
+    const struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *) frame;
+
+    if (!info || !info->secure_nan) {
+        ALOGE("%s: secure nan NULL", __FUNCTION__);
+        return;
+    }
+
+    peer = nan_pairing_get_peer_from_list(info->secure_nan, (u8 *)mgmt->da);
+    if (!peer) {
+        ALOGE("nl80211: Peer not found in the pairing list");
+        return;
+    }
+
+    pasn = &peer->pasn;
+
+    if (mgmt->u.auth.auth_transaction == 1)
+        nan_pairing_notify_initiator_response(handle, (u8 *)mgmt->da);
+    else if (mgmt->u.auth.auth_transaction == 2) {
+        peer->is_pairing_in_progress = false;
+        nan_pairing_notify_responder_response(handle, (u8 *)mgmt->da);
+     }
+
+    ALOGV("nl80211: Authentication frame TX status: ack=%d", !!ack);
+    ret = wpa_pasn_auth_tx_status(pasn, frame, len, ack != NULL);
+    if (ret == 1) {
+        ALOGI("nl80211: PASN transaction Success");
+        nan_pairing_set_keys_from_cache(handle, pasn->own_addr, pasn->peer_addr,
+                                        pasn->cipher, pasn->akmp,
+                                        SECURE_NAN_PAIRING_RESPONDER);
+        return;
+    }
+}
+
+void wifihal_event_mgmt(wifi_handle handle, struct nlattr *freq, const u8 *frame,
+                        size_t len)
+{
+    int ret = 0;
+    u16 fc, stype;
+    const struct ieee80211_hdr *hdr = (const struct ieee80211_hdr *)frame;
+
+    fc = le_to_host16(hdr->frame_control);
+    stype = WLAN_FC_GET_STYPE(fc);
+
+    if (WLAN_FC_GET_TYPE(fc) != WLAN_FC_TYPE_MGMT)
+        return;
+
+    if (len < 24) {
+        ALOGI("nl80211: Too short management frame");
+        return;
+    }
+
+    if (stype == WLAN_FC_STYPE_AUTH)
+        nan_rx_mgmt_auth(handle, frame, len);
+    else if (stype == WLAN_FC_STYPE_ACTION)
+        nan_rx_mgmt_action(handle, frame, len);
+
+    return;
+}
+#endif /* WPA_PASN_LIB */

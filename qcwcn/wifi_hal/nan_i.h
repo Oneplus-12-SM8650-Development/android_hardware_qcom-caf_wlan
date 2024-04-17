@@ -15,7 +15,7 @@
  *
  * Changes from Qualcomm Innovation Center are provided under the following license:
  *
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted (subject to the limitations in the
@@ -60,6 +60,23 @@ extern "C"
 {
 #endif /* __cplusplus */
 
+#ifdef WPA_PASN_LIB
+#include "utils/os.h"
+#include "utils/common.h"
+#include "utils/eloop.h"
+#include "common/defs.h"
+#include "common/wpa_common.h"
+#include "common/sae.h"
+#include "common/ieee802_11_common.h"
+#include "common/ptksa_cache.h"
+#include "crypto/sha256.h"
+#include "crypto/sha384.h"
+#include "crypto/aes_wrap.h"
+#include "eap_peer/eap_config.h"
+#include "crypto/random.h"
+#include "pasn/pasn_common.h"
+#endif
+
 #ifndef PACKED
 #define PACKED  __attribute__((packed))
 #endif
@@ -96,6 +113,77 @@ extern "C"
 #define BIT_29              0x20000000
 #define BIT_30              0x40000000
 #define BIT_31              0x80000000
+
+#define NAN_F_MS(_v, _f)                                            \
+            ( ((_v) & (_f)) >> (_f##_S) )
+
+#define NAN_CSIA_GRPKEY_SUPPORT_S 1
+#define NAN_CSIA_GRPKEY_SUPPORT (0x2 << NAN_CSIA_GRPKEY_SUPPORT_S)
+#define NAN_CSIA_GRPKEY_SUPPORT_GET(x) NAN_F_MS(x,NAN_CSIA_GRPKEY_SUPPORT)
+
+#define NAN_CSIA_GRPKEY_LEN_S 4
+#define NAN_CSIA_GRPKEY_LEN (0x1 << NAN_CSIA_GRPKEY_LEN_S)
+#define NAN_CSIA_GRPKEY_LEN_GET(x) NAN_F_MS(x,NAN_CSIA_GRPKEY_LEN)
+#define NAN_CSIA_GRPKEY_LEN_16   16
+#define NAN_CSIA_GRPKEY_LEN_32   32
+#define NAN_MAX_SD_ATTRS_PER_FRAME 20
+#define NAN_SD_ATTR_SERVICE_ID_LEN  6
+#define NAN_SDF_MAX_LEN 750
+#define NAN_SD_ATTR_MAX_LEN         \
+    (NAN_SDF_MAX_LEN -              \
+     24 - /* MAC Header */          \
+      6)  /* PAF header */
+#define NAN_SD_ATTR_MIN_LEN         \
+    (1 + /* Attribute ID     */     \
+     2 + /* Attribute Length */     \
+     NAN_SD_ATTR_SERVICE_ID_LEN +   \
+     1 + /* Instance ID      */     \
+     1 + /* Requestor ID     */     \
+     1)  /* Service Control  */
+#define NAN_SDE_ATTR_MIN_LEN 3
+#define NAN_SDE_ATTR_SERVICE_INFO_HEADER_LEN    \
+    (3 + /* OUI */                              \
+     1 /* Service Protocol Type */ )
+
+/* NAN TLV Maximum Lengths */
+#define NAN_MAX_EXT_SERVICE_SPECIFIC_INFO_LEN 270
+#define NAN_FOLLOWUP_MAX_EXT_SERVICE_SPECIFIC_INFO_LEN 1400
+#define NAN_MAX_BOOTSTRAPPING_COOKIE_LEN 255
+#define NAN_MAX_SHARED_KEY_DESC_ATTR_LEN 256
+#define NAN_MAX_FOLLOWUP_IND_SIZE                                    \
+    (                                                                \
+        sizeof(NanMsgHeader)                                     +   \
+        sizeof(NanFollowupIndParams)                             +   \
+        SIZEOF_TLV_HDR + (sizeof(u8) * NAN_MAC_ADDR_LEN)         +   \
+        SIZEOF_TLV_HDR + NAN_MAX_SERVICE_SPECIFIC_INFO_LEN           \
+    )
+#define NAN_MAX_FOLLOWUP_IND_SIZE_EXT_SSI                                \
+    (                                                                    \
+        sizeof(NanMsgHeader)                                     +       \
+        sizeof(NanFollowupIndParams)                             +       \
+        SIZEOF_TLV_HDR + (sizeof(u8) * NAN_MAC_ADDR_LEN)         +       \
+        SIZEOF_TLV_HDR + NAN_FOLLOWUP_MAX_EXT_SERVICE_SPECIFIC_INFO_LEN  \
+    )
+
+/* Service Descriptor Attribute Constants */
+
+/* Service Control Flags */
+#define NAN_SVC_CTRL_FLAG_MATCH_FILTER          0x04
+#define NAN_SVC_CTRL_FLAG_SERVICE_RSP           0x08
+#define NAN_SVC_CTRL_FLAG_SERVICE_INFO          0x10
+#define NAN_SVC_CTRL_FLAG_BINDING_BITMAP        0x40
+
+#define NAN_SDE_ATTR_LEN_OFFSET 1
+#define NAN_SDE_ATTR_CTRL_RANGE_LIMIT_OFFSET 8
+#define NAN_SDE_ATTR_CTRL_SERVICE_UPDATE_INDI_PRESENT 9
+
+#define NAN_NPBA_ATTR_MIN_LEN       \
+    (1 + /* Attribute ID     */     \
+     2 + /* Attribute Length */     \
+     1 + /* Dialog Token     */     \
+     1 + /* Type and Status  */     \
+     1 + /* Reason code      */     \
+     2 ) /* Pairing Bootstrapping Method */
 
 /** macro to convert FW MAC address from WMI word format to User Space MAC char array */
 #define FW_MAC_ADDR_TO_CHAR_ARRAY(fw_mac_addr, mac_addr) do { \
@@ -160,6 +248,12 @@ typedef enum
     NAN_MSG_ID_SELF_TRANSMIT_FOLLOWUP_IND   = 35,
     NAN_MSG_ID_RANGING_REQUEST_RECEVD_IND   = 36,
     NAN_MSG_ID_RANGING_RESULT_IND           = 37,
+    NAN_MSG_ID_IDENTITY_RESOLUTION_IND      = 38,
+    NAN_MSG_ID_PAIRING_IND                  = 39,
+    NAN_MSG_ID_UNPAIRING_IND                = 40,
+    NAN_MSG_ID_OEM_REQ                      = 41,
+    NAN_MSG_ID_OEM_RSP                      = 42,
+    NAN_MSG_ID_OEM_IND                      = 43,
     NAN_MSG_ID_TESTMODE_REQ                 = 1025,
     NAN_MSG_ID_TESTMODE_RSP                 = 1026
 } NanMsgId;
@@ -206,6 +300,14 @@ typedef enum
     NAN_TLV_TYPE_DEV_CAP_ATTR_CAPABILITY = 29,
     NAN_TLV_TYPE_IP_TRANSPORT_PARAM = 30,
     NAN_TLV_TYPE_SERVICE_ID = 31,
+    NAN_TLV_TYPE_PAIRING_CONFIGURATION = 32,
+    NAN_TLV_TYPE_PAIRING_MATCH_PARAMS = 33,
+    NAN_TLV_TYPE_BOOTSTRAPPING_PARAMS = 34,
+    NAN_TLV_TYPE_BOOTSTRAPPING_COOKIE = 35,
+    NAN_TLV_TYPE_NIRA_NONCE  = 36,
+    NAN_TLV_TYPE_NIRA_TAG = 37,
+    NAN_TLV_TYPE_NAN_CSID_EXT = 38,
+    NAN_TLV_TYPE_CSIA_CAP = 39,
     NAN_TLV_TYPE_SDF_LAST = 4095,
 
     /* Configuration types */
@@ -252,6 +354,9 @@ typedef enum
     NAN_TLV_TYPE_DW_EARLY_TERMINATION = 4136,
     NAN_TLV_TYPE_TX_RX_CHAINS = 4137,
     NAN_TLV_TYPE_ENABLE_DEVICE_RANGING = 4138,
+    NAN_TLV_TYPE_UNSYNC_DISCOVERY_ENABLED = 4139,
+    NAN_TLV_TYPE_FOLLOWUP_MGMT_RX_ENABLED = 4140,
+
     NAN_TLV_TYPE_CONFIG_LAST = 8191,
 
     /* Attributes types */
@@ -262,6 +367,7 @@ typedef enum
     NAN_TLV_TYPE_RECEIVED_RSSI_VALUE,
     NAN_TLV_TYPE_CLUSTER_ATTRIBUTE,
     NAN_TLV_TYPE_WLAN_INFRA_SSID,
+    NAN_TLV_TYPE_NAN_SHARED_KEY_DESC_ATTR,
     NAN_TLV_TYPE_ATTRS_LAST = 12287,
 
     /* Events Type */
@@ -293,6 +399,18 @@ typedef enum
     NAN_TLV_TYPE_TESTMODE_FIRST = 36864,
     NAN_TLV_TYPE_TESTMODE_GENERIC_CMD = NAN_TLV_TYPE_TESTMODE_FIRST,
     NAN_TLV_TYPE_TESTMODE_LAST = 37000,
+
+    /* NAN Security types */
+    NAN_TLV_TYPE_SEC_FIRST = 37001,
+    NAN_TLV_TYPE_SEC_IGTK_KDE = NAN_TLV_TYPE_SEC_FIRST,
+    NAN_TLV_TYPE_SEC_BIGTK_KDE,
+    NAN_TLV_TYPE_SEC_NM_TK,
+    NAN_TLV_TYPE_SEC_LAST = 37100,
+
+    /* NAN OEM Configuration types */
+    NAN_TLV_TYPE_OEM_DATA_FIRST = 37101,
+    NAN_TLV_TYPE_OEM1_DATA = NAN_TLV_TYPE_OEM_DATA_FIRST,
+    NAN_TLV_TYPE_OEM_DATA_LAST  = 37150,
 
     NAN_TLV_TYPE_LAST = 65535
 } NanTlvType;
@@ -678,6 +796,120 @@ typedef struct PACKED
     u8 s:1;
 } NanSidAttr, *pSidAttr;
 
+/* type + length + oui + oui type */
+#define NAN_IE_HEADER 6
+#define NAN_IE_VENDOR_TYPE 0x506f9a13
+#define DCEA_PARING_SETUP_ENABLED  BIT(8)
+#define DCEA_NPK_CACHING_ENABLED  BIT(9)
+#define WPA_NDP_PMK_MAX_LEN 32
+#define WPA_OPP_NPK_MAX_LEN 32
+
+/* As per NAN spec, below are the values defined for CSID attribute */
+#define NCS_SK_128          1
+#define NCS_SK_256          2
+#define NCS_PK_2WDH_128     3
+#define NCS_PK_2WDH_256     4
+#define NCS_GTK_CCMP_128    5
+#define NCS_GTK_GCMP_256    6
+#define NCS_PK_PASN_128     7
+#define NCS_PK_PASN_256     8
+
+enum nan_attr_id {
+    NAN_ATTR_ID_SERVICE_DESCRIPTOR = 0x3,
+    NAN_ATTR_ID_SDE                = 0xE,
+    NAN_ATTR_ID_CSIA               = 0x22,
+    NAN_ATTR_ID_SHARED_KEY_DESC    = 0x24,
+    NAN_ATTR_ID_DCEA               = 0x2A,
+    NAN_ATTR_ID_NPBA               = 0x2C,
+    NAN_ATTR_ID_NIRA               = 0x2B,
+};
+
+#define NAN_GTK_LEN 16
+#define NAN_GTK_MAX_LEN 32
+#define NAN_IGTK_LEN 16
+#define NAN_IGTK_MAX_LEN 32
+#define NAN_BIGTK_LEN 16
+#define NAN_BIGTK_MAX_LEN 32
+#define NAN_IGTK_KDE_PREFIX_LEN (2 + 6)
+#define NAN_BIGTK_KDE_PREFIX_LEN (2 + 6)
+#define NAN_MAX_SHARED_KEY_ATTR_LEN 1024
+#define MAX_IGTK_KDE_LEN 70
+#define MAX_BIGTK_KDE_LEN 70
+#define NAN_SHARED_KEY_ATTR_ID 0x24
+#define NAN_ENCRYPT_KEY_DATA   BIT(12)
+#define NAN_VENDOR_ATTR_TYPE   0xdd
+
+#define NAN_KDE_TYPE_IGTK                 0x02
+#define NAN_KDE_TYPE_BIGTK                0x03
+#define NAN_KDE_TYPE_IGTK_LIFETIME        0x06
+#define NAN_KDE_TYPE_BIGTK_LIFETIME       0x07
+#define NAN_KDE_TYPE_NIK                  0x24
+#define NAN_KDE_TYPE_NIK_LIFETIME         0x25
+
+#define NAN_IGTK_KEY_IDX                   4
+#define NAN_BIGTK_KEY_IDX                  6
+
+/* sub attribute iteration helpers */
+#define for_each_nan_subattr(_subattr, _data, _datalen)                    \
+        for (_subattr = (const nan_subattr *) (_data);                  \
+             (const u8 *) (_data) + (_datalen) - (const u8 *) _subattr >=  \
+                (int) sizeof(*_subattr) &&                                 \
+             (const u8 *) (_data) + (_datalen) - (const u8 *) _subattr >=  \
+                (int) sizeof(*_subattr) + _subattr->datalen;                  \
+             _subattr = (const nan_subattr *) (_subattr->data + _subattr->datalen))
+
+#define for_each_nan_subattr_id(subattr, _id, data, datalen)            \
+        for_each_nan_subattr(subattr, data, datalen)                    \
+                if (subattr->id == (_id))
+
+typedef struct PACKED {
+         u8 id;
+         u16 datalen;
+         u8 data[];
+} nan_subattr;
+
+typedef struct PACKED {
+        u8 attr_id;
+        u16 len;
+        u16 cap_info;
+} nan_dcea;
+
+typedef struct PACKED {
+        u8 cipher;
+        u8 pub_id;
+} nan_csa;
+
+typedef struct PACKED {
+        u8 attr_id;
+        u16 len;
+        u8 caps;
+        nan_csa csa[0];
+} nan_csia;
+
+typedef struct PACKED {
+        u8 attr_id;
+        u16 len;
+        u8 dialog_token;
+        u8 type_status;
+        u8 reason_code;
+        u16 bootstrapping_method;
+} nan_npba;
+
+typedef struct PACKED {
+        u8 attr_id;
+        u16 len;
+        u8 cipher_ver;
+        u8 nonce_tag[32];
+} nan_nira;
+
+typedef struct PACKED {
+        u8 attr_id;
+        u16 len;
+        u8 service_id[6];
+        u8 instance_id;
+        u8 requestor_id;
+        u8 service_control_flags;
+} nan_sda;
 
 /* NAN Configuration Req */
 typedef struct PACKED
@@ -1063,6 +1295,8 @@ typedef enum {
     NAN_INDICATION_SELF_TRANSMIT_FOLLOWUP  =10,
     NAN_INDICATION_RANGING_REQUEST_RECEIVED =11,
     NAN_INDICATION_RANGING_RESULT           =12,
+    NAN_INDICATION_IDENTITY_RESOLUTION      =13,
+    NAN_INDICATION_VENDOR_EVENT             =14,
     NAN_INDICATION_UNKNOWN                 =0xFFFF
 } NanIndicationType;
 
@@ -1097,11 +1331,17 @@ typedef struct PACKED
     u32 max_scid_len;
     u32 is_ndp_security_supported:1;
     u32 max_sdea_service_specific_info_len:16;
-    u32 reserved1:5;
-    u32 reserved2:5;
+    u32 max_nan_rtt_initiator_supported:5;
+    u32 max_nan_rtt_responder_supported:5;
     u32 ndpe_attr_supported:1;
-    u32 reserved:4;
+    u32 nan_pairing_supported:1;
+    u32 nan_usd_publisher_supported:1;
+    u32 nan_usd_subscriber_supported:1;
+    u32 reserved:1;
     u32 max_subscribe_address;
+    u32 max_nan_pairing_sessions;
+    u32 nan_group_mfp_cap;
+
 } NanCapabilitiesRspMsg, *pNanCapabilitiesRspMsg;
 
 /* NAN Self Transmit Followup */
@@ -1110,6 +1350,14 @@ typedef struct PACKED
     NanMsgHeader fwHeader;
     u32 reason;
 } NanSelfTransmitFollowupIndMsg, *pNanSelfTransmitFollowupIndMsg;
+
+/* NAN Group MFP support */
+#define NAN_GTKSA_IGTKSA_BIGTKSA_NOT_SUPPORTED             0x00
+#define NAN_GTKSA_IGTKSA_SUPPORTED_BIGTKSA_NOT_SUPPORTED   0x01
+#define NAN_GTKSA_IGTKSA_BIGTKSA_SUPPORTED                 0x02
+
+/* Mask to check extended csid type is set */
+#define NAN_EXT_CSID_TYPE_MASK  ~0x3
 
 /* NAN Cipher Suite Shared Key */
 typedef struct PACKED
@@ -1130,7 +1378,8 @@ typedef struct PACKED
     u32 ranging_required:1;
     u32 range_limit_present:1;
     u32 service_update_ind_present:1;
-    u32 reserved1:6;
+    u32 gtk_protection:1;
+    u32 reserved1:5;
     u32 range_report:1;
     u32 reserved2:15;
 } NanFWSdeaCtrlParams;
@@ -1149,6 +1398,101 @@ typedef struct PACKED
     u32 ranging_indication_event;
     NanFWGeoFenceDescriptor geo_fence_threshold;
 } NanFWRangeConfigParams;
+
+typedef struct PACKED
+{
+    u32 pairing_setup_required:1;
+    u32 npk_nik_caching_required:1;
+    u32 bootstrapping_method_bitmap:16;
+    u32 reserved:14;
+} NanFWPairingConfigParams;
+
+typedef struct PACKED
+{
+    u32 pairing_setup_required:1;
+    u32 npk_nik_caching_required:1;
+    u32 bootstrapping_method_bitmap:16;
+    u32 reserved:14;
+} NanFWPairingParamsMatch;
+
+typedef struct
+{
+    u8 instance_id;
+    u16 sdea_control;
+    u16 range_limit_ingress;
+    u16 range_limit_egress;
+    u8 service_update_indicator;
+    u16 ssi_len;
+    u8 ssi[NAN_FOLLOWUP_MAX_EXT_SERVICE_SPECIFIC_INFO_LEN];
+} nan_sdea;
+
+typedef enum {
+    NAN_BS_TYPE_ADVERTISE = 0,
+    NAN_BS_TYPE_REQUEST,
+    NAN_BS_TYPE_RESPONSE,
+} NanBootstrappingType;
+
+typedef enum {
+    NAN_BS_STATUS_ACCEPT = 0,
+    NAN_BS_STATUS_REJECT,
+    NAN_BS_STATUS_COMEBACK,
+} NanBootstrappingStatus;
+
+typedef struct PACKED
+{
+    u8 type;
+    u8 status;
+    u8 dialog_token;
+    u8 reason_code;
+    u16 bootstrapping_method_bitmap;
+    u16 comeback_after;
+} NanFWBootstrappingParams;
+
+/* NAN Identity Resolution Params */
+typedef struct PACKED
+{
+    u32 cipher_version:8;
+    u32 reserved:24;
+} NanFWIdentityResolutionParams;
+
+
+typedef struct PACKED
+{
+    NanMsgHeader fwHeader;
+    NanFWIdentityResolutionParams identityresolutionParams;
+    /*
+     * Excludes TLVs
+     *
+     * Required: Nounce, Tag
+     */
+    u8 ptlv[];
+} NanFWIdentityResolutionReqMsg, *pNanFWIdentityResolutionReqMsg;
+
+/* NAN Pairing Request Params */
+typedef struct PACKED
+{
+    u32 pairing_handle;
+    u32 pairing_verification;
+    u32 cipher_suite;
+} NanFWPairingIndParams;
+
+typedef struct PACKED
+{
+    NanMsgHeader               fwHeader;
+    NanFWPairingIndParams      pairingIndParams;
+    /* TLVs Required:
+       MANDATORY
+       1. MAC_ADDRESS (Peer NMI)
+       2. NM_TK (The TK derived from pairing)
+    */
+    u8 ptlv[];
+} NanFWPairingIndMsg, *pNanFWPairingIndMsg;
+
+typedef struct PACKED
+{
+    NanMsgHeader               fwHeader;
+    u32                        pairing_handle;
+} NanFWUnPairingIndMsg, *pFWNanUnPairingIndMsg;
 
 typedef struct PACKED
 {
@@ -1309,6 +1653,270 @@ typedef struct PACKED
     u8 ptlv[1];
 } NanFWRangeReqRecvdInd, *pNanFWRangeReqRecvdInd;
 
+#define NIR_STR_LEN 3
+#define NAN_MAX_HASH_LEN 32
+
+static inline int is_zero_nan_identity_key(const u8 *buf)
+{
+    u8 zero[NAN_IDENTITY_KEY_LEN] = { 0 };
+
+    return !memcmp(zero, buf, NAN_IDENTITY_KEY_LEN);
+}
+
+typedef struct PACKED {
+    u32 cipher_version;
+    u32 nonce_len;
+    u32 tag_len;
+    u8 nonce[NAN_IDENTITY_NONCE_LEN];
+    u8 tag[NAN_IDENTITY_TAG_LEN];
+} NanNIRARequest;
+
+struct nanGrpKey {
+    int cipher;
+    u8 gtk[NAN_GTK_MAX_LEN];
+    size_t gtk_len;
+    u32 gtk_life_time;
+    u8 igtk[NAN_IGTK_MAX_LEN];
+    size_t igtk_len;
+    u32 igtk_life_time;
+    u8 bigtk[NAN_BIGTK_MAX_LEN];
+    size_t bigtk_len;
+    u32 bigtk_life_time;
+};
+
+struct PACKED sharedKeyDesc {
+    u8 attrID;
+    u16 length;
+    u8 publishID;
+    u8 keyDescriptor[0];
+};
+
+struct PACKED keyDescriptor {
+    u8 descriptorType;
+    u16 keyInfo;
+    u16 keyLength;
+    u8 keyReplayCounter[8];
+    u8 keyNonce[32];
+    u8 eapolKeyIV[16];
+    u8 keyRsc[8];
+    u8 reserved[8];
+    u8 keyMic[16];
+    u16 keyDataLen;
+    u8 keyData[0];
+};
+
+struct PACKED nanKDE {
+    u8 type;
+    u8 length;
+    u8 oui[3];
+    u8 dataType;
+    u8 data[0];
+};
+
+struct PACKED nikKDE {
+    u8 cipher;
+    u8 nik_data[0];
+};
+
+struct PACKED nikLifetime {
+    u32 lifetime;
+};
+
+struct PACKED igtkKDE {
+        u8 keyid[2];
+        u8 pn[6];
+        u8 igtk[0];
+};
+
+#define NAN_BIGTK_KDE_PREFIX_LEN (2 + 6)
+struct PACKED bigtkKDE {
+        u8 keyid[2];
+        u8 pn[6];
+        u8 bigtk[0];
+};
+
+struct PACKED igtkLifetime {
+       u32 lifetime;
+};
+
+struct PACKED bigtkLifetime {
+       u32 lifetime;
+};
+
+typedef struct {
+    /* Advertise shared key descriptor holding Group keys */
+    u16 pub_sub_id;
+    u32 requestor_instance_id;
+    u8 peer_disc_mac_addr[NAN_MAC_ADDR_LEN];
+    u16 shared_key_attr_len;
+    u8 shared_key_attr[NAN_MAX_SHARED_KEY_ATTR_LEN];
+} NanSharedKeyRequest, *pNanSharedKeyRequest;
+
+/* Enumeration for NAN device current role */
+enum secure_nan_role {
+    SECURE_NAN_IDLE = 0,
+    SECURE_NAN_BOOTSTRAPPING_INITIATOR,
+    SECURE_NAN_BOOTSTRAPPING_RESPONDER,
+    SECURE_NAN_PAIRING_INITIATOR,
+    SECURE_NAN_PAIRING_RESPONDER,
+};
+
+/* This is nan identity key params of the device */
+struct nanIDkey {
+    /* AKMP used for NIK derviation */
+    int akmp;
+    /* cipher suite type */
+    int cipher;
+    /* NIK expiration time in seconds */
+    int expiration;
+    /* buffer to hold the NIK */
+    u8 nik_data[NAN_IDENTITY_KEY_LEN];
+    /* length of NIK */
+    size_t nik_len;
+    /* nonce used in NIRA attribute */
+    u8 nira_nonce[NAN_IDENTITY_NONCE_LEN];
+    /* length of nonce */
+    size_t nira_nonce_len;
+    /* tag computed for nonce using NIK */
+    u8 nira_tag[NAN_IDENTITY_TAG_LEN];
+    /* length of tag */
+    size_t nira_tag_len;
+};
+
+/* This is data structure to hold PASN M1 frame.
+ * It will be freed, when pairing indication response is received.
+ */
+struct pasn_auth_frame {
+    /* buf to store PASN auth frame */
+    u8 data[MAX_FRAME_LEN_80211_MGMT];
+    /* length of frame */
+    u32 len;
+};
+
+/* This is nan pairing peer information.
+ * This is an entry in the list of all pairing peers.
+ */
+struct nan_pairing_peer_info {
+    /* list of pairing peers */
+    struct list_head list;
+#ifdef WPA_PASN_LIB
+    /* pasn data required for authentication */
+    struct pasn_data pasn;
+#endif
+    /* is trans_id valid */
+    bool trans_id_valid;
+    /* current transaction ID */
+    transaction_id trans_id;
+    /* publisg/subscribe ID received in auth frames */
+    u16 pub_sub_id;
+    /* requestor instance ID */
+    u32 requestor_instance_id;
+    /* bootstrapping instance ID for the peer */
+    u32 bootstrapping_instance_id;
+    /* pairing instance ID local to the device */
+    u32 pairing_instance_id;
+    /* ndp ID of latest instance */
+    u32 ndp_instance_id;
+    /* bssid of pairing peer */
+    u8 bssid[NAN_MAC_ADDR_LEN];
+    /* current role of the peer based on the handshake frame received */
+    enum secure_nan_role peer_role;
+    /* bootstrapping methods advertised by peer */
+    u16 peer_supported_bootstrap;
+    /* peer nan identity key. Valid for a successfully paired peer */
+    u8 peer_nik[NAN_IDENTITY_KEY_LEN];
+    /* life time of peer nik in seconds */
+    u32 peer_nik_lifetime;
+    /* passphrase length */
+    size_t passphrase_len;
+    /* passphrase */
+    char *passphrase;
+    /* sae password id to derive pt */
+    char *sae_password_id;
+    /* flag to check if pairing in progress with same peer */
+    bool is_pairing_in_progress;
+    /* flag to check if peer is paired */
+    bool is_paired;
+    /* capability info in DCEA attribute */
+    u16 dcea_cap_info;
+    /* publisher ID in CSIA attribute */
+    u8 csia_pub_id;
+    struct pasn_auth_frame *frame;
+};
+
+struct wpa_secure_nan {
+    /* NAN device own address */
+    u8 own_addr[NAN_MAC_ADDR_LEN];
+    /* NAN cluster address */
+    u8 cluster_addr[NAN_MAC_ADDR_LEN];
+    /* pub sub ID of latest instance */
+    u16 pub_sub_id;
+    /* bootstrapping ID of latest instance */
+    u32 bootstrapping_id;
+    /* pairing ID of latest instance */
+    u32 pairing_id;
+    /* device capability to enable pairing setup */
+    u32 enable_pairing_setup;
+    /* device capability to enable pairing cache */
+    u32 enable_pairing_cache;
+    /* device supported bootstrapping */
+    u16 supported_bootstrap;
+    /* nan pairing ptksa cache list */
+    struct ptksa_cache *ptksa;
+    /* nan pairing initiator pmksa cache list */
+    struct rsn_pmksa_cache *initiator_pmksa;
+    /* nan pairing responder pmksa cache list */
+    struct rsn_pmksa_cache *responder_pmksa;
+    /* device nan identity key info */
+    struct nanIDkey *dev_nik;
+    /* device nan group key info */
+    struct nanGrpKey *dev_grp_keys;
+    /* nan pairing callback ctx, holds wifi_handle */
+    void *cb_ctx;
+    /* nan pairing callback iface name, holds interface name */
+    char iface_name[IFNAMSIZ+1];
+    /* list of pairing peers */
+    struct list_head peers;
+    /* pointer to rsne buffer */
+    struct wpabuf *rsne;
+    /* pointer to rsnxe buffer */
+    struct wpabuf *rsnxe;
+};
+
+/***************************************************
+ * Wi-Fi HAL and Firmware interface for oem data
+ ***************************************************/
+
+#define NAN_OEM1_DATA_MAX_LEN  1024
+
+/* NAN Command request */
+typedef struct PACKED
+{
+    NanMsgHeader fwHeader;
+    /* TLVs Required:
+       MANDATORY
+       1. command in byte format
+    */
+    u8 ptlv[];
+} NanFWOemReqMsg, *pNanFWOemReqMsg;
+
+/* NAN Command Rsp */
+typedef struct PACKED
+{
+    NanMsgHeader fwHeader;
+    u16 status;
+    u16 value;
+    u8 ptlv[];
+} NanFWOemRspMsg, *pNanFWOemRspMsg;
+
+/* NAN Event Ind */
+typedef struct PACKED
+{
+    NanMsgHeader fwHeader;
+    u16 reserved[2];
+    u8 ptlv[];
+} NanFWOemIndMsg, *pNanFWOemIndMsg;
+
 /* Function for NAN error translation
    For NanResponse, NanPublishTerminatedInd, NanSubscribeTerminatedInd,
    NanDisabledInd, NanTransmitFollowupInd:
@@ -1319,6 +1927,93 @@ void NanErrorTranslation(NanInternalStatusType firmwareErrorRecvd,
                          u32 valueRcvd,
                          void *pRsp,
                          bool is_ndp_rsp);
+
+/* nan pairing internal function prototypes */
+int secure_nan_init(wifi_interface_handle iface);
+int secure_nan_cache_flush(hal_info *info);
+int secure_nan_deinit(hal_info *info);
+void nan_pairing_set_nira(struct wpa_secure_nan *secure_nan);
+unsigned int nan_pairing_get_nik_lifetime(struct nanIDkey *nik);
+struct rsn_pmksa_cache *nan_pairing_initiator_pmksa_cache_init(void);
+void nan_pairing_initiator_pmksa_cache_deinit(struct rsn_pmksa_cache *pmksa);
+struct rsn_pmksa_cache *nan_pairing_responder_pmksa_cache_init(void);
+void nan_pairing_responder_pmksa_cache_deinit(struct rsn_pmksa_cache *pmksa);
+struct nan_pairing_peer_info*
+nan_pairing_add_peer_to_list(struct wpa_secure_nan *secure_nan, u8 *mac);
+struct nan_pairing_peer_info*
+nan_pairing_get_peer_from_list(struct wpa_secure_nan *secure_nan, u8 *mac);
+struct nan_pairing_peer_info*
+nan_pairing_get_peer_from_id(struct wpa_secure_nan *secure_nan, u32 pairing_id);
+struct nan_pairing_peer_info*
+nan_pairing_get_peer_from_bootstrapping_id(struct wpa_secure_nan *secure_nan,
+                                           u32 bootstrapping_id);
+struct nan_pairing_peer_info*
+nan_pairing_get_peer_from_ndp_id(struct wpa_secure_nan *secure_nan,
+                                 u32 ndp_instance_id);
+void nan_pairing_remove_peers_with_nik(hal_info *info, u8 *nik, u8 *skip_mac);
+void nan_pairing_delete_list(struct wpa_secure_nan *secure_nan);
+void nan_pairing_delete_peer_from_list(struct wpa_secure_nan *secure_nan,
+                                       u8 *mac);
+int nan_send_tx_mgmt(void *ctx, const u8 *frame_buf, size_t frame_len,
+                     int noack, unsigned int freq, unsigned int wait_dur);
+struct wpabuf *nan_pairing_generate_rsn_ie(int akmp, int cipher, u8 *pmkid);
+struct wpabuf *nan_pairing_generate_rsnxe(int akmp);
+const u8 *nan_attr_from_nan_ie(const u8 *nan_ie, enum nan_attr_id attr);
+const u8 *nan_get_attr_from_ies(const u8 *ies, size_t ies_len,
+                                enum nan_attr_id attr);
+void nan_pairing_add_setup_ies(struct wpa_secure_nan *secure_nan,
+                               struct pasn_data *pasn, int peer_role);
+void nan_pairing_add_verification_ies(struct wpa_secure_nan *secure_nan,
+                                      struct pasn_data *pasn, int peer_role);
+int nan_pasn_kdk_to_ndp_pmk(const u8 *kdk, size_t kdk_len, const u8 *spa,
+                            const u8 *bssid, u8 *ndp_pmk, u32 *ndp_pmk_len);
+int nan_pasn_kdk_to_opportunistic_npk(const u8 *kdk, size_t kdk_len,
+                                      const u8 *spa, const u8 *bssid,
+                                      int akmp, int cipher, u8 *opp_npk,
+                                      size_t *opp_npk_len);
+int nan_pasn_kdk_to_nan_kek(const u8 *kdk, size_t kdk_len, const u8 *spa,
+                            const u8 *bssid, int akmp, int cipher, u8 *nan_kek,
+                            size_t *nan_kek_len);
+int nan_pairing_validate_custom_pmkid(void *ctx, const u8 *bssid,
+                                      const u8 *pmkid);
+void nan_pairing_set_password(struct nan_pairing_peer_info *peer, u8 *passphrase,
+                              u32 len);
+void nan_pairing_notify_initiator_response(wifi_handle handle, u8 *bssid);
+void nan_pairing_notify_responder_response(wifi_handle handle, u8 *bssid);
+int nan_pairing_handle_pasn_auth(wifi_handle handle, const u8 *data, size_t len);
+int nan_pairing_set_keys_from_cache(wifi_handle handle, u8 *src_addr, u8 *bssid,
+                                    int cipher, int akmp, int role);
+wifi_error nan_set_nira_request(transaction_id id, wifi_interface_handle iface,
+                                const u8 *nan_identity_key);
+wifi_error nan_sharedkey_followup_request(transaction_id id,
+                                     wifi_interface_handle iface,
+                                     NanSharedKeyRequest *msg);
+wifi_error nan_validate_shared_key_desc(hal_info *info, const u8 *addr, u8 *buf,
+                                        u16 len);
+wifi_error nan_get_shared_key_descriptor(hal_info *info, const u8 *addr,
+                                         NanSharedKeyRequest *key);
+int nan_pairing_initiator_pmksa_cache_add(struct rsn_pmksa_cache *pmksa,
+                                          u8 *bssid, u8 *pmk, u32 pmk_len);
+int nan_pairing_initiator_pmksa_cache_get(struct rsn_pmksa_cache *pmksa,
+                                          u8 *bssid, u8 *pmkid);
+void nan_pairing_initiator_pmksa_cache_flush(struct rsn_pmksa_cache *pmksa);
+int nan_pairing_responder_pmksa_cache_add(struct rsn_pmksa_cache *pmksa,
+                                          u8 *own_addr, u8 *bssid, u8 *pmk,
+                                          u32 pmk_len);
+int nan_pairing_responder_pmksa_cache_get(struct rsn_pmksa_cache *pmksa,
+                                          u8 *bssid, u8 *pmkid);
+void nan_pairing_responder_pmksa_cache_flush(struct rsn_pmksa_cache *pmksa);
+void nan_pairing_derive_grp_keys(hal_info *info, u8* addr, u32 cipher_caps);
+bool is_nira_present(struct wpa_secure_nan *secure_nan, const u8 *frame,
+                     size_t len);
+struct nan_pairing_peer_info*
+nan_pairing_initialize_peer_for_verification(struct wpa_secure_nan *secure_nan,
+                                             u8 *mac);
+void nan_rx_mgmt_auth(wifi_handle handle, const u8 *frame, size_t len);
+int nan_register_action_frames(wifi_interface_handle iface);
+int nan_register_action_dual_protected_frames(wifi_interface_handle iface);
+void nan_rx_mgmt_auth(wifi_handle handle, const u8 *frame, size_t len);
+void nan_rx_mgmt_action(wifi_handle handle, const u8 *frame, size_t len);
 
 #ifdef __cplusplus
 }
