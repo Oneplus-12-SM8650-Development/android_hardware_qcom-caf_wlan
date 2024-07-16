@@ -12,7 +12,6 @@
 #include <utils/Log.h>
 #include <errno.h>
 
-#ifdef WPA_PASN_LIB
 static const int nanPMKLifetime = 43200;
 #define NAN_PAIRING_SSID "516F9A010000"
 
@@ -405,6 +404,18 @@ void nan_process_followup_frame(wifi_handle handle, const u8 *buf,
     NanFollowupIndMsg *followInd;
     NanFWBootstrappingParams npba;
 
+    nanCommand = NanCommand::instance(handle);
+    if (nanCommand == NULL) {
+        ALOGE("%s: Error NanCommand NULL", __FUNCTION__);
+        return;
+    }
+
+    if (!nanCommand->isNanEnabled()) {
+        ALOGE("%s: Dropping followup rx frame from " MACSTR,
+              __FUNCTION__, MAC2STR(mac));
+        return;
+    }
+
     memset(&npba, 0, sizeof(NanFWBootstrappingParams));
 
     if (len < 5) {
@@ -478,12 +489,6 @@ void nan_process_followup_frame(wifi_handle handle, const u8 *buf,
             default:
                 break;
         }
-    }
-
-    nanCommand = NanCommand::instance(handle);
-    if (nanCommand == NULL) {
-        ALOGE("%s: Error NanCommand NULL", __FUNCTION__);
-        return;
     }
 
     for (i = 0; i < sda_count; ++i) {
@@ -625,6 +630,85 @@ void nan_rx_mgmt_action(wifi_handle handle, const u8 *frame, size_t len)
     return;
 }
 
+static int nan_send_nl_msg_event_sock(hal_info *info, struct nl_msg *msg)
+{
+    int res = 0;
+    struct nl_cb * cb = NULL;
+
+    if (!info->event_sock) {
+        ALOGE("event socket is null");
+        return -1;
+    }
+
+    /* send message */
+    res = nl_send_auto_complete(info->event_sock, msg);
+    if (res < 0) {
+           ALOGE("%s: send msg failed. err = %d",__func__, res);
+           return res;
+    }
+
+    cb = nl_socket_get_cb(info->event_sock);
+
+    /* err is populated as part of finish_handler */
+    while (res > 0)
+        res = nl_recvmsgs(info->event_sock, cb);
+
+    nl_cb_put(cb);
+    return res;
+}
+
+static int nan_register_frames(wifi_interface_handle iface, u16 type,
+                               const u8 *frame_match, size_t match_len)
+{
+    u32 idx;
+    struct nl_msg * msg;
+    wifi_handle wifiHandle = getWifiHandle(iface);
+    hal_info *info = getHalInfo(wifiHandle);
+
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ALOGE("%s: nlmsg malloc failed", __FUNCTION__);
+        return -1;
+    }
+
+    genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
+                NL80211_CMD_REGISTER_FRAME, 0);
+
+    idx = if_nametoindex(DEFAULT_NAN_IFACE);
+    nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
+
+    nla_put_u16(msg, NL80211_ATTR_FRAME_TYPE, type);
+    nla_put(msg, NL80211_ATTR_FRAME_MATCH, match_len, frame_match);
+
+    nan_send_nl_msg_event_sock(info, msg);
+
+    if (msg)
+        nlmsg_free(msg);
+
+    return 0;
+}
+
+int nan_register_action_frames(wifi_interface_handle iface)
+{
+    /* wlan type:mgmt, wlan subtype: action */
+    u16 type = (WLAN_FC_TYPE_MGMT << 2) | (WLAN_FC_STYPE_ACTION << 4);
+    /* register for Public Action frames */
+    const u8 nan_action_match[6] = {0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13};
+
+    return nan_register_frames(iface, type, nan_action_match, 6);
+}
+
+int nan_register_action_dual_protected_frames(wifi_interface_handle iface)
+{
+    /* wlan type:mgmt, wlan subtype: action */
+    u16 type = (WLAN_FC_TYPE_MGMT << 2) | (WLAN_FC_STYPE_ACTION << 4);
+    /* register for Public Action Dual Protected frames */
+    const u8 nan_action_dual_match[6] = {0x09, 0x09, 0x50, 0x6f, 0x9a, 0x13};
+
+    return nan_register_frames(iface, type, nan_action_dual_match, 6);
+}
+
+#ifdef WPA_PASN_LIB
 void nan_rx_mgmt_auth(wifi_handle handle, const u8 *frame, size_t len)
 {
     int ret = 0;
@@ -962,33 +1046,6 @@ static int nan_send_nl_msg(hal_info *info, struct nl_msg *msg)
 out:
     nl_cb_put(cb);
     pthread_mutex_unlock(&info->cb_lock);
-    return res;
-}
-
-static int nan_send_nl_msg_event_sock(hal_info *info, struct nl_msg *msg)
-{
-    int res = 0;
-    struct nl_cb * cb = NULL;
-
-    if (!info->event_sock) {
-        ALOGE("event socket is null");
-        return -1;
-    }
-
-    /* send message */
-    res = nl_send_auto_complete(info->event_sock, msg);
-    if (res < 0) {
-           ALOGE("%s: send msg failed. err = %d",__func__, res);
-           return res;
-    }
-
-    cb = nl_socket_get_cb(info->event_sock);
-
-    /* err is populated as part of finish_handler */
-    while (res > 0)
-        res = nl_recvmsgs(info->event_sock, cb);
-
-    nl_cb_put(cb);
     return res;
 }
 
@@ -1523,6 +1580,19 @@ static u32 wpa_alg_to_cipher_suite(enum wpa_alg alg, size_t key_len)
     }
 }
 
+
+static void nl80211_nlmsg_clear(struct nl_msg *msg)
+{
+   if (msg) {
+       struct nlmsghdr *hdr = nlmsg_hdr(msg);
+       void *data = nlmsg_data(hdr);
+       int len = hdr->nlmsg_len - NLMSG_HDRLEN;
+
+       os_memset(data, 0, len);
+   }
+}
+
+
 static int nan_pairing_set_key(hal_info *info, int alg, const u8 *addr,
                                int key_idx, int set_tx, const u8 *seq,
                                size_t seq_len, const u8 *key, size_t key_len,
@@ -1532,54 +1602,53 @@ static int nan_pairing_set_key(hal_info *info, int alg, const u8 *addr,
     u32 suite;
     struct nl_msg *msg;
     struct nl_msg *key_msg;
-    int ret = 0;
+    int ret = -1;
 
     idx = if_nametoindex(DEFAULT_NAN_IFACE);
 
     if (check_key_flag((enum key_flag) key_flag)) {
         ALOGE("%s: invalid key_flag", __FUNCTION__);
-        return WIFI_ERROR_INVALID_ARGS;
+        return ret;
     }
 
     msg = nlmsg_alloc();
+    if (!msg) {
+        ALOGE("%s: msg allocation failed\n", __FUNCTION__);
+        return ret;
+    }
     key_msg = nlmsg_alloc();
-    if (!msg || !key_msg) {
-        ALOGE("%s: Memory allocation failed\n", __FUNCTION__);
-        return WIFI_ERROR_OUT_OF_MEMORY;
+    if (!key_msg) {
+        nlmsg_free(msg);
+        ALOGE("%s: Key msg allocation failed\n", __FUNCTION__);
+        return ret;
     }
 
     if ((key_flag & KEY_FLAG_PAIRWISE_MASK) ==
         KEY_FLAG_PAIRWISE_RX_TX_MODIFY) {
         ALOGV("%s: nl80211: SET_KEY (pairwise RX/TX modify)", __FUNCTION__);
-        genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
-                    NL80211_CMD_SET_KEY, 0);
-        nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
-        if(!msg)
-           goto fail2;
+        if (!genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
+                         NL80211_CMD_SET_KEY, 0) ||
+            nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx))
+            goto fail;
     } else if (alg == WPA_ALG_NONE && (key_flag & KEY_FLAG_RX_TX)) {
         ALOGE("%s: invalid key_flag to delete key", __FUNCTION__);
-        ret = WIFI_ERROR_INVALID_ARGS;
-        goto fail2;
+        goto fail;
     } else if (alg == WPA_ALG_NONE) {
         ALOGV("%s: nl80211: DEL_KEY", __FUNCTION__);
-        genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
-                    NL80211_CMD_DEL_KEY, 0);
-        nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
-        if(!msg)
-           goto fail2;
+        if (!genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
+                         NL80211_CMD_DEL_KEY, 0) ||
+            nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx))
+            goto fail;
     } else {
         suite = wpa_alg_to_cipher_suite((enum wpa_alg) alg, key_len);
         if (!suite) {
-            ret = WIFI_ERROR_INVALID_ARGS;
-            goto fail2;
+            goto fail;
         }
         ALOGV("%s: nl80211: NEW_KEY", __FUNCTION__);
-        genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
-                    NL80211_CMD_NEW_KEY, 0);
-        nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
-        if (!msg)
-            goto fail2;
-        if (nla_put(key_msg, NL80211_KEY_DATA, key_len, key) ||
+        if (!genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
+                         NL80211_CMD_NEW_KEY, 0) ||
+            nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx) ||
+            nla_put(key_msg, NL80211_KEY_DATA, key_len, key) ||
             nla_put_u32(key_msg, NL80211_KEY_CIPHER, suite))
             goto fail;
         if (seq && seq_len) {
@@ -1598,17 +1667,15 @@ static int nan_pairing_set_key(hal_info *info, int alg, const u8 *addr,
             (key_flag & KEY_FLAG_PAIRWISE_MASK) ==
             KEY_FLAG_PAIRWISE_RX_TX_MODIFY) {
             if (nla_put_u8(key_msg, NL80211_KEY_MODE,
-                      key_flag == KEY_FLAG_PAIRWISE_RX ? NL80211_KEY_NO_TX : NL80211_KEY_SET_TX))
+                           key_flag == KEY_FLAG_PAIRWISE_RX ? NL80211_KEY_NO_TX : NL80211_KEY_SET_TX))
                 goto fail;
         } else if ((key_flag & KEY_FLAG_GROUP_MASK) ==
                     KEY_FLAG_GROUP_RX) {
             ALOGV("%s:    RSN IBSS RX GTK", __FUNCTION__);
-            if (nla_put_u32(key_msg, NL80211_KEY_TYPE,
-                            NL80211_KEYTYPE_GROUP))
+            if (nla_put_u32(key_msg, NL80211_KEY_TYPE, NL80211_KEYTYPE_GROUP))
                 goto fail;
         } else if (!(key_flag & KEY_FLAG_PAIRWISE)) {
             ALOGV("%s:  key_flag missing PAIRWISE when setting a pairwise key", __FUNCTION__);
-            ret = WIFI_ERROR_INVALID_ARGS;
             goto fail;
         } else {
             ALOGV("%s: pairwise key", __FUNCTION__);
@@ -1616,7 +1683,6 @@ static int nan_pairing_set_key(hal_info *info, int alg, const u8 *addr,
     } else if ((key_flag & KEY_FLAG_PAIRWISE) ||
                !(key_flag & KEY_FLAG_GROUP)) {
         ALOGE("%s: invalid key_flag for a broadcast key", __FUNCTION__);
-        ret = WIFI_ERROR_INVALID_ARGS;
         goto fail;
     } else {
         ALOGV("%s: broadcast key", __FUNCTION__);
@@ -1628,7 +1694,7 @@ static int nan_pairing_set_key(hal_info *info, int alg, const u8 *addr,
     ret = nan_send_nl_msg(info, msg);
 fail:
     nlmsg_free(msg);
-fail2:
+    nl80211_nlmsg_clear(key_msg);
     nlmsg_free(key_msg);
     return ret;
 }
@@ -1756,37 +1822,6 @@ int nan_pairing_set_keys_from_cache(wifi_handle handle, u8 *src_addr, u8 *bssid,
     return WIFI_SUCCESS;
 }
 
-static int nan_register_frames(wifi_interface_handle iface, u16 type,
-                               const u8 *frame_match, size_t match_len)
-{
-    u32 idx;
-    struct nl_msg * msg;
-    wifi_handle wifiHandle = getWifiHandle(iface);
-    hal_info *info = getHalInfo(wifiHandle);
-
-    msg = nlmsg_alloc();
-    if (!msg) {
-        ALOGE("%s: nlmsg malloc failed", __FUNCTION__);
-        return -1;
-    }
-
-    genlmsg_put(msg, 0, 0, info->nl80211_family_id, 0, 0,
-                NL80211_CMD_REGISTER_FRAME, 0);
-
-    idx = if_nametoindex(DEFAULT_NAN_IFACE);
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
-
-    nla_put_u16(msg, NL80211_ATTR_FRAME_TYPE, type);
-    nla_put(msg, NL80211_ATTR_FRAME_MATCH, match_len, frame_match);
-
-    nan_send_nl_msg_event_sock(info, msg);
-
-    if (msg)
-        nlmsg_free(msg);
-
-    return 0;
-}
-
 static int nan_pairing_register_pasn_auth_frames(wifi_interface_handle iface)
 {
     /* wlan type:mgmt, wlan subtype: auth */
@@ -1795,26 +1830,6 @@ static int nan_pairing_register_pasn_auth_frames(wifi_interface_handle iface)
     const u8 pasn_auth_match[2] = {7,0};
 
     return nan_register_frames(iface, type, pasn_auth_match, 2);
-}
-
-int nan_register_action_frames(wifi_interface_handle iface)
-{
-    /* wlan type:mgmt, wlan subtype: action */
-    u16 type = (WLAN_FC_TYPE_MGMT << 2) | (WLAN_FC_STYPE_ACTION << 4);
-    /* register for Public Action frames */
-    const u8 nan_action_match[6] = {0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13};
-
-    return nan_register_frames(iface, type, nan_action_match, 6);
-}
-
-int nan_register_action_dual_protected_frames(wifi_interface_handle iface)
-{
-    /* wlan type:mgmt, wlan subtype: action */
-    u16 type = (WLAN_FC_TYPE_MGMT << 2) | (WLAN_FC_STYPE_ACTION << 4);
-    /* register for Public Action Dual Protected frames */
-    const u8 nan_action_dual_match[6] = {0x09, 0x09, 0x50, 0x6f, 0x9a, 0x13};
-
-    return nan_register_frames(iface, type, nan_action_dual_match, 6);
 }
 
 int nan_pasn_kdk_to_ndp_pmk(const u8 *kdk, size_t kdk_len, const u8 *spa,
@@ -2390,6 +2405,10 @@ void nan_pairing_set_password(struct nan_pairing_peer_info *peer, u8 *passphrase
     pairing_ssid = reinterpret_cast<const u8 *> (NAN_PAIRING_SSID);
     pairing_ssid_len = strlen(NAN_PAIRING_SSID);
     peer->passphrase = (char *)os_zalloc(len + 1);
+    if (!peer->passphrase) {
+        ALOGE("%s: Mem Alloc for passphrase failed", __FUNCTION__);
+        return;
+    }
     strlcpy(peer->passphrase, reinterpret_cast<const char *> (passphrase),
             len + 1);
     peer->pasn.pt = sae_derive_pt(NULL, pairing_ssid, pairing_ssid_len,
@@ -2568,55 +2587,61 @@ int secure_nan_init(wifi_interface_handle iface)
         return 0;
     }
 
-    secure_nan = (struct wpa_secure_nan *)os_zalloc(sizeof(*secure_nan));
-
-    if (!secure_nan) {
-        ALOGE("%s: Memory allocation failed \n", __FUNCTION__);
-        return -1;
-    }
-
     if (eloop_init()) {
         ALOGE("Secure NAN eloop init failed");
         return -1;
     }
 
+    secure_nan = (struct wpa_secure_nan *)os_zalloc(sizeof(*secure_nan));
+
+    if (!secure_nan) {
+        ALOGE("%s: Memory allocation failed \n", __FUNCTION__);
+        eloop_destroy();
+        return -1;
+    }
+
+    info->secure_nan = secure_nan;
     secure_nan->cb_ctx = wifiHandle;
+
+    //! Initailise peers list
+    INITIALISE_LIST(&secure_nan->peers);
+
     wifi_get_iface_name(iface, secure_nan->iface_name,
                         sizeof(secure_nan->iface_name));
     secure_nan->ptksa = ptksa_cache_init();
     if (!secure_nan->ptksa) {
         ALOGE("Secure NAN PTKSA init failed");
-        return -1;
+        goto fail;
     }
 
     secure_nan->dev_nik = nan_pairing_nik_init();
     if (!secure_nan->dev_nik)
-        return -1;
+        goto fail;
 
     secure_nan->initiator_pmksa = nan_pairing_initiator_pmksa_cache_init();
     if (!secure_nan->initiator_pmksa) {
         ALOGE("Secure NAN Initiator PMKSA cache init failed");
-        return -1;
+        goto fail;
     }
 
     secure_nan->responder_pmksa = nan_pairing_responder_pmksa_cache_init();
     if (!secure_nan->responder_pmksa) {
         ALOGE("Secure NAN Responder PMKSA cache init failed");
-        return -1;
+        goto fail;
     }
-
-    info->secure_nan = secure_nan;
-    //! Initailise peers list
-    INITIALISE_LIST(&secure_nan->peers);
 
     if (nan_pairing_register_pasn_auth_frames(iface)) {
         ALOGE("Secure NAN Register PASN auth failed");
-        return -1;
+        goto fail;
     }
 
     eloop_run();
 
     return 0;
+
+fail:
+    secure_nan_deinit(info);
+    return -1;
 }
 
 int secure_nan_cache_flush(hal_info *info)
@@ -2703,18 +2728,6 @@ int secure_nan_cache_flush(hal_info *info)
 int secure_nan_deinit(hal_info *info)
 {
     ALOGE("Secure NAN deinit not supported");
-    return -1;
-}
-
-int nan_register_action_frames(wifi_interface_handle iface)
-{
-    ALOGE("NAN register action frames is not supported");
-    return -1;
-}
-
-int nan_register_action_dual_protected_frames(wifi_interface_handle iface)
-{
-    ALOGE("NAN register action dual protection frames is not supported");
     return -1;
 }
 
